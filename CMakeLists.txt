@@ -308,7 +308,6 @@ set(VLLM_EXT_SRC
   "csrc/cuda_view.cu"
   "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
   "csrc/quantization/activation_kernels.cu"
-  "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
   "csrc/torch_bindings.cpp"
   "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
@@ -348,9 +347,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     )
   endif()
   FetchContent_MakeAvailable(cutlass)
-
-  list(APPEND VLLM_EXT_SRC
-    "csrc/cutlass_extensions/common.cpp")
 
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_EXT_SRC}"
