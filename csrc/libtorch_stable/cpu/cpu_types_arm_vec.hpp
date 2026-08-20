@@ -100,6 +100,17 @@ inline neon_bfloat16x8_t bf16_dup(c10::BFloat16 v) {
   uint16_t bits;
   std::memcpy(&bits, &v, sizeof(bits));
 #ifdef ARM_BF16_SUPPORT
+  // Workaround for GCC <= 13 miscompiling a constant bf16 broadcast: it can
+  // lower a compile-time-constant bf16 dup to an FP16 immediate move (e.g.
+  // writing 0x3C00 = ~0.0078 per lane) instead of materializing the actual
+  // bf16 bit pattern (0x3F80 for 1.0). Fixed in gcc-14. A plain
+  // memcpy/reinterpret isn't enough since gcc constant-tracks through it and
+  // rematerializes the buggy immediate at the use site, so launder the bits
+  // through an asm barrier first. See ATen's vec128_bfloat16_neon.h for the
+  // same workaround.
+  #if __GNUC__ <= 13 && !defined(__clang__)
+  __asm__("" : "+r"(bits));
+  #endif
   bfloat16_t h;
   std::memcpy(&h, &bits, sizeof(h));
   return vdupq_n_bf16(h);
@@ -152,13 +163,85 @@ struct Vectorized<float> {
     return loadu(buf);
   }
 
-  Vectorized erf() const {
-    return map_scalar([](float x) { return std::erf(x); });
+  // Implementation adapted from Arm Optimized Routines
+  // https://github.com/ARM-software/optimized-routines/blob/master/math/aarch64/advsimd/expf.c
+  // (also used by ATen's NEON vec backend). Falls back to scalar std::exp
+  // for the rare inputs where |x| > 87.3..., outside this polynomial's
+  // valid range.
+  Vectorized exp_u20() const {
+    const float32x4_t special_bound = vdupq_n_f32(0x1.5d5e2ap+6f);
+    uint32x4_t cmp = vcagtq_f32(values, special_bound);
+    if (vpaddd_u64(vreinterpretq_u64_u32(cmp)) != 0) {
+      return map_scalar([](float x) { return std::exp(x); });
+    }
+
+    const float32x4_t inv_ln2 = vdupq_n_f32(0x1.715476p+0f);
+    constexpr float ln2_hi = 0x1.62e4p-1f;
+    constexpr float ln2_lo = 0x1.7f7d1cp-20f;
+    constexpr float c0 = 0x1.0e4020p-7f;
+    constexpr float c2 = 0x1.555e66p-3f;
+    const float32x4_t ln2_c02 = {ln2_hi, ln2_lo, c0, c2};
+
+    const uint32x4_t exponent_bias = vdupq_n_u32(0x3f800000);
+    const float32x4_t c1 = vdupq_n_f32(0x1.573e2ep-5f);
+    const float32x4_t c3 = vdupq_n_f32(0x1.fffdb6p-2f);
+    const float32x4_t c4 = vdupq_n_f32(0x1.ffffecp-1f);
+
+    // exp(x) = 2^n (1 + poly(r)), with 1 + poly(r) in [1/sqrt(2), sqrt(2)]
+    // x = ln2*n + r, with r in [-ln2/2, ln2/2].
+    float32x4_t n = vrndaq_f32(vmulq_f32(values, inv_ln2));
+    float32x4_t r = vfmsq_laneq_f32(values, n, ln2_c02, 0);
+    r = vfmsq_laneq_f32(r, n, ln2_c02, 1);
+    uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_s32(vcvtq_s32_f32(n)), 23);
+    float32x4_t scale = vreinterpretq_f32_u32(vaddq_u32(e, exponent_bias));
+
+    float32x4_t r2 = vmulq_f32(r, r);
+    float32x4_t p = vfmaq_laneq_f32(c1, r, ln2_c02, 2);
+    float32x4_t q = vfmaq_laneq_f32(c3, r, ln2_c02, 3);
+    q = vfmaq_f32(q, p, r2);
+    p = vmulq_f32(c4, r);
+    float32x4_t poly = vfmaq_f32(p, q, r2);
+
+    return vfmaq_f32(scale, poly, scale);
   }
+
+  // Implementation adapted from ATen's NEON vec backend: a fast, less
+  // precise exp variant intended for cases where outputs will be downcast
+  // to FP16/BF16 (e.g. attention softmax). Accurate within 1 ULP for
+  // FP16/BF16 for inputs in [-87.683, 88.376]; clamps outside that range to
+  // 0 / inf instead of over/underflowing.
   Vectorized fexp_u20() const {
-    return map_scalar([](float x) { return std::exp(x); });
+    const float32x4_t lower_bound = vdupq_n_f32(-0x1.5ebb82p+6f);
+    const float32x4_t upper_bound = vdupq_n_f32(0x1.61814ap+6f);
+    const float32x4_t inv_ln2 = vdupq_n_f32(0x1.715476p+0f);
+    constexpr float ln2 = 0x1.62e43p-1f;
+    constexpr float c2 = 0x1.5592ecp-3f;
+    const float32x4_t c3 = vdupq_n_f32(0x1.017d34p-1f);
+    const uint32x4_t lt_lower = vcltq_f32(values, lower_bound);
+    const uint32x4_t gt_upper = vcgtq_f32(values, upper_bound);
+
+    // exp(x) = 2^n (1 + exp(r)), r = x - n*ln2, n = round(x / ln2)
+    // exp(r) ~ poly(r) = r + r^2 * (c3 + c2 * r)
+    float32x4_t n = vrndaq_f32(vmulq_f32(values, inv_ln2));
+    float32x4_t r = vfmsq_n_f32(values, n, ln2);
+    uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_s32(vcvtq_s32_f32(n)), 23);
+
+    float32x4_t r2 = vmulq_f32(r, r);
+    float32x4_t q = vfmaq_n_f32(c3, r, c2);
+    float32x4_t s = vaddq_f32(vdupq_n_f32(1.0f), r);
+    float32x4_t p = vfmaq_f32(s, q, r2);
+
+    float32x4_t y =
+        vreinterpretq_f32_u32(vaddq_u32(vreinterpretq_u32_f32(p), e));
+
+    y = vbslq_f32(lt_lower, vdupq_n_f32(0.0f), y);
+    y = vbslq_f32(gt_upper, vdupq_n_f32(INFINITY), y);
+    return y;
   }
-  Vectorized exp_u20() const { return fexp_u20(); }
+
+  // Defined out-of-line below, after the bitwise operators and fmadd() it
+  // depends on.
+  Vectorized erf() const;
 };
 
 inline Vectorized<float> operator+(const Vectorized<float>& a,
@@ -176,6 +259,16 @@ inline Vectorized<float> operator*(const Vectorized<float>& a,
 inline Vectorized<float> operator/(const Vectorized<float>& a,
                                    const Vectorized<float>& b) {
   return vdivq_f32(a, b);
+}
+inline Vectorized<float> operator&(const Vectorized<float>& a,
+                                   const Vectorized<float>& b) {
+  return vreinterpretq_f32_u32(
+      vandq_u32(vreinterpretq_u32_f32(a), vreinterpretq_u32_f32(b)));
+}
+inline Vectorized<float> operator^(const Vectorized<float>& a,
+                                   const Vectorized<float>& b) {
+  return vreinterpretq_f32_u32(
+      veorq_u32(vreinterpretq_u32_f32(a), vreinterpretq_u32_f32(b)));
 }
 
 inline Vectorized<float> maximum(const Vectorized<float>& a,
@@ -195,6 +288,39 @@ inline Vectorized<float> fmadd(const Vectorized<float>& a,
                                const Vectorized<float>& b,
                                const Vectorized<float>& c) {
   return vfmaq_f32(c, a, b);
+}
+
+// Implementation adapted from ATen's NEON vec backend: Abramowitz & Stegun
+// rational approximation, reusing exp_u20() for the exp(-x^2) term.
+inline Vectorized<float> Vectorized<float>::erf() const {
+  const Vectorized<float> neg_zero_vec(-0.f);
+  const Vectorized<float> one_vec(1.0f);
+  const Vectorized<float> p(0.3275911f);
+  const Vectorized<float> p1(0.254829592f);
+  const Vectorized<float> p2(-0.284496736f);
+  const Vectorized<float> p3(1.421413741f);
+  const Vectorized<float> p4(-1.453152027f);
+  const Vectorized<float> p5(1.061405429f);
+  // sign(x)
+  auto sign_mask = neg_zero_vec & *this;
+  auto abs_vec = this->abs();
+  // t = 1 / (p * abs(x) + 1)
+  auto tmp0 = fmadd(p, abs_vec, one_vec);
+  auto t = one_vec / tmp0;
+  // r = p5 * t^4 + p4 * t^3 + p3 * t^2 + p2 * t + p1
+  auto tmp1 = fmadd(p5, t, p4);
+  auto tmp2 = fmadd(tmp1, t, p3);
+  auto tmp3 = fmadd(tmp2, t, p2);
+  auto r = fmadd(tmp3, t, p1);
+  // -exp(-x*x)
+  auto pow_2 = (*this) * (*this);
+  auto neg_pow_2 = pow_2 ^ neg_zero_vec;
+  auto tmp4 = neg_pow_2.exp_u20();
+  auto tmp5 = tmp4 ^ neg_zero_vec;
+  // erf(x) = sign(x) * (1 - r * t * exp(-x*x))
+  auto tmp6 = t * tmp5;
+  auto tmp7 = fmadd(tmp6, r, one_vec);
+  return tmp7 ^ sign_mask;
 }
 
 template <typename AccT>
@@ -251,10 +377,18 @@ struct Vectorized<c10::Half> {
   }
 
   Vectorized abs() const {
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    return Vectorized(vabsq_f16(values));
+#else
     return map_via_float([](float x) { return std::fabs(x); });
+#endif
   }
   Vectorized sqrt() const {
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    return Vectorized(vsqrtq_f16(values));
+#else
     return map_via_float([](float x) { return std::sqrt(x); });
+#endif
   }
 };
 
