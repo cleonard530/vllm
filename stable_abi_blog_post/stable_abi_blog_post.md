@@ -64,58 +64,112 @@ This was the only major API limitation for in-tree vLLM, and an is_pinned() stab
 The runtime overhead comes primarily from dispatch through the PyTorch dispatcher and the boxing and unboxing of StableIValue arguments and return values. Dispatch overhead is on the order of a few microseconds and the overhead from boxing and unboxing is even smaller. For most kernels, this overhead is negligible relative to execution time and becomes significant only in rare cases of frequently launching very short-running kernels without optimizations such as CUDA graphs. We observed no noticeable runtime regressions from the migration.
 
 
-### Migrating vLLM to the Stable ABI
-Migrating an extension to the stable ABI is a mostly mechanical endeavor, replacing calls to unstable APIs with those of stable APIs. 
+<style>
+.abi-story__row {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(14rem, 1fr);
+  column-gap: 2rem;
+}
+.abi-story__copy { grid-column: 1; grid-row: 1; min-width: 0; padding-bottom: 1.5rem; }
+.abi-story__event { grid-column: 2; grid-row: 1; min-width: 0; border-left: 3px solid #6b7280; padding: 0 0 1.5rem 1rem; }
+.abi-story__copy > :first-child, .abi-story__event > :first-child { margin-top: 0; }
+.abi-story__copy > :last-child, .abi-story__event > :last-child { margin-bottom: 0; }
+.abi-story__row:last-child > * { padding-bottom: 0; }
+.abi-story__table { max-width: 100%; overflow-x: auto; }
+@media (max-width: 48rem) {
+  .abi-story__row { grid-template-columns: minmax(0, 1fr); }
+  .abi-story__copy { padding-bottom: 0; }
+  .abi-story__event { grid-column: 1; grid-row: 2; margin-bottom: 1.5rem; }
+}
+</style>
 
+<div class="abi-story">
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<h3>Migrating vLLM to the Stable ABI</h3>
+<p>Migrating an extension to the stable ABI is a mostly mechanical endeavor, replacing calls to unstable APIs with those of stable APIs.</p>
+<p>The challenge is ensuring everything goes smoothly and is complete, since even one unstable dependency means the whole library is unstable. We started by identifying which APIs vLLM used that were not yet supported by the Stable ABI. Where we found gaps, we worked to add the missing stable APIs upstream in PyTorch (see the <a href="https://github.com/vllm-project/vllm/issues/26946">RFC to make vLLM stable</a>).</p>
+</div>
+<div class="abi-story__event">
+<h4>Timeline</h4>
+<p><strong>October 15, 2025</strong><br>RFC opened to begin discussion of migrating to the Stable ABI. <a href="https://github.com/vllm-project/vllm/issues/26946">RFC</a></p>
+</div>
+</div>
 
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<p>Other requirements for migrating an extension include using Python for AutogradFunctions and meta functions, since PyTorch's stable ABI does not support these yet, and making sure the ops are registered through the PyTorch dispatcher with TORCH_LIBRARY. Fortunately, the in-tree vLLM implementation already met these requirements, so the bulk of the work involved replacing unstable APIs with stable equivalents and verifying that the migrated code preserved the original behavior.</p>
+</div>
+<div class="abi-story__event">
+<p><strong>December 29, 2025</strong><br>First migration PR opened: <a href="https://github.com/vllm-project/vllm/pull/31509">PR #31509</a></p>
+</div>
+</div>
 
-The challenge is ensuring everything goes smoothly and is complete, since even one unstable dependency means the whole library is unstable. We started by identifying which APIs vLLM used that were not yet supported by the Stable ABI. Where we found gaps, we worked to add the missing stable APIs upstream in PyTorch
-(see the [RFC to make vLLM stable](https://github.com/vllm-project/vllm/issues/26946)).
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<p>To help with this process, we created skills and used agents to help with the migration process (see <a href="https://github.com/janeyx99/abi-stable-skills">abi-stable-skills</a>). These skills helped assess the migration requirements and can help automate many other parts of the migration process. The most-used skill was migrate-to-stable-apis, which defined the mappings between unstable and stable APIs and helped prevent common issues, such as agents making unrelated changes beyond the scope of the migration.</p>
+</div>
+<div class="abi-story__event">
+<p><strong>March 19, 2026</strong><br>First migration PR closed.</p>
+</div>
+</div>
 
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<p>Given vLLM's size and its millions of users, we couldn't simply hand the entire migration to an agent and hope that everything goes smoothly. We needed to verify that every line we updated was working just as it did before, so we broke the work into smaller, manageable changes that could be reviewed and tested incrementally. We created a separate stable library, _C_stable_libtorch.abi3.so, and gradually moved kernels into it in batches. This broke the migration into small, manageable updates so that the maintainer and we could check every line of code before it was merged into vLLM. This manual review, along with unit and performance tests, helped us verify that the migration preserved behavior and did not introduce noticeable regressions.</p>
+<p>We also needed to verify that the new library no longer depended on unstable PyTorch ABI symbols. For this we used <a href="https://pypi.org/project/torch-abi-audit/">torch-abi-audit</a>, which traces compiled libraries to identify stable and unstable PyTorch symbol usage. Reaching zero unstable PyTorch symbols in the audited library provided evidence that its PyTorch ABI dependencies had been migrated successfully.</p>
+</div>
+<div class="abi-story__event">
+<p><strong>March–June 19, 2026</strong><br>12+ more PRs were merged, making vLLM in-tree torch ABI Stable.</p>
+</div>
+</div>
 
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<p>Migrating vLLM source alone does not establish that the entire vLLM wheel is ABI-stable. For the wheel to be completely stable, its compiled dependencies must be torch ABI Stable as well. vLLM currently has seven dependencies that also depend on LibTorch. These are:</p>
+<div class="abi-story__table">
+<table>
+<thead><tr><th>Dependency</th><th>Migrated on vLLM Fork</th><th>Migrated Upstream</th></tr></thead>
+<tbody>
+<tr><td>FlashMLA</td><td>✅</td><td>✅</td></tr>
+<tr><td>DeepGEMM</td><td>✅</td><td>🚧 Work in progress</td></tr>
+<tr><td>FlashAttention-2</td><td>✅</td><td>🚧 PR open to make it stable</td></tr>
+<tr><td>FlashAttention-3</td><td>✅</td><td>✅</td></tr>
+<tr><td>DeepSelect</td><td>✅</td><td>🚧 Work in progress</td></tr>
+<tr><td>FlashKDA</td><td>✅</td><td>❌</td></tr>
+<tr><td>QuTLASS</td><td>N/A</td><td>✅</td></tr>
+</tbody>
+</table>
+</div>
+<p>After the in-tree vLLM code had been migrated, each of these dependencies was migrated to the torch Stable ABI as well, making the entire vLLM wheel LibTorch ABI Stable. We also added a CI check using <a href="https://pypi.org/project/torch-abi-audit/">torch-abi-audit</a> to verify that every compiled library in the vLLM wheel remains torch ABI Stable.</p>
+</div>
+<div class="abi-story__event">
+<p><strong>July–August 2026</strong><br>vLLM pinned stable FlashMLA, QuTLASS, FlashAttention 2, FlashKDA, and FlashAttention 3.</p>
+</div>
+</div>
 
-Other requirements for migrating an extension include using Python for AutogradFunctions and meta functions, since PyTorch's stable ABI does not support these yet, and making sure the ops are registered through the PyTorch dispatcher with TORCH_LIBRARY. Fortunately, the in-tree vLLM implementation already met these requirements, so the bulk of the work involved replacing unstable APIs with stable equivalents and verifying that the migrated code preserved the original behavior.
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<h3>Challenges Along the Way</h3>
+<p>As mentioned earlier, migrating to the Stable ABI was largely a mechanical process of replacing unstable API calls and headers with their stable counterparts. The biggest challenges came from working in a large, rapidly evolving project. Files were frequently changing upstream, so we had to keep our migration up to date and resolve merge conflicts carefully to avoid introducing unintended changes. Occasionally, upstream changes introduced new API usage without a direct Stable ABI equivalent. In these cases, we had to find alternatives or wrappers that preserved the original behavior.</p>
+<p>Each dependency also presented its own challenges, from differences in build and packaging processes to differences in how operators were registered and imported in Python. DeepGEMM was a particularly challenging dependency for many reasons. First, it was registering its operators using pybind11, which meant we had to update it to register its ops with TORCH_LIBRARY before we migrated to the stable ABI. Also, around the same time as our Stable ABI migration, DeepGEMM was transitioning from version 1.x to version 2.0, bringing a rapid stream of changes. This transition introduced a new dependency, DeepJIT, which depended on LibTorch and therefore needed to be migrated to the Stable ABI first. Around this same time, vLLM was bouncing back and forth between using DeepSeek's upstream repo and its own fork before finally settling on its own fork for the DeepGEMM library.</p>
+</div>
+<div class="abi-story__event">
+<p><strong>September 13, 2026</strong><br>vLLM pinned stable DeepSelect.</p>
+</div>
+</div>
 
-To help with this process, we created skills and used agents to help with the migration process (see https://github.com/janeyx99/abi-stable-skills). These skills helped assess the migration requirements and can help automate many other parts of the migration process. The most-used skill was migrate-to-stable-apis, which defined the mappings between unstable and stable APIs and helped prevent common issues, such as agents making unrelated changes beyond the scope of the migration.
-Given vLLM's size and its millions of users, we couldn't simply hand the entire migration to an agent and hope that everything goes smoothly. We needed to verify that every line we updated was working just as it did before, so we broke the work into smaller, manageable changes that could be reviewed and tested incrementally. We created a separate stable library, _C_stable_libtorch.abi3.so, and gradually moved kernels into it in batches. This broke the migration into small, manageable updates so that the maintainer and we could check every line of code before it was merged into vLLM. This manual review, along with unit and performance tests, helped us verify that the migration preserved behavior and did not introduce noticeable regressions.
-We also needed to verify that the new library no longer depended on unstable PyTorch ABI symbols. For this we used [torch-abi-audit](https://pypi.org/project/torch-abi-audit/), which traces compiled libraries to identify stable and unstable PyTorch symbol usage. Reaching zero unstable PyTorch symbols in the audited library provided evidence that its PyTorch ABI dependencies had been migrated successfully. 
-Migrating vLLM source alone does not establish that the entire vLLM wheel is ABI-stable. For the wheel to be completely stable, its compiled dependencies must be torch ABI Stable as well. vLLM currently has seven dependencies that also depend on LibTorch. These are:
+<div class="abi-story__row">
+<div class="abi-story__copy">
+<p>Once the changes settled down, we migrated DeepJIT to the Stable ABI and moved vllm-project/DeepGEMM's operator registration from pybind11 to TORCH_LIBRARY. Since this was a large merge, we waited a few days before migrating to the Stable ABI. Just as we were about to merge, vLLM merged its branch with upstream, requiring us to make a substantial update to the Stable ABI. We were finally able to migrate DeepGEMM to the Stable ABI, and as of October 15, 2026, vLLM and its build dependencies are all torch ABI Stable.</p>
+</div>
+<div class="abi-story__event">
+<p><strong>October 15, 2026</strong><br>vLLM pinned stable DeepGEMM, making the vLLM CUDA wheel completely torch ABI Stable—exactly one year after #26946 was opened.</p>
+</div>
+</div>
+</div>
 
-
-| **Dependency**   | **Migrated on vLLM Fork** | **Migrated Upstream**          |
-|------------------|---------------------------|--------------------------------|
-| FlashMLA         | ✅                        | ✅                             |
-| DeepGEMM         | ✅                        | 🚧 Work in progress            |
-| FlashAttention-2 | ✅                        | 🚧 PR open to make it stable   |
-| FlashAttention-3 | ✅                        | ✅                             |
-| DeepSelect       | ✅                        | 🚧 Work in progress            |
-| FlashKDA         | ✅                        | ❌                             |
-| QuTLASS          | N/A                       | ✅                             |
-
-After the in-tree vLLM code had been migrated, each of these dependencies was migrated to the torch Stable ABI as well, making the entire vLLM wheel LibTorch ABI Stable. We also added a CI check using [torch-abi-audit](https://pypi.org/project/torch-abi-audit/) to verify that every compiled library in the vLLM wheel remains torch ABI Stable.
-
-### Challenges Along the Way
-As mentioned earlier, migrating to the Stable ABI was largely a mechanical process of replacing unstable API calls and headers with their stable counterparts. The biggest challenges came from working in a large, rapidly evolving project. Files were frequently changing upstream, so we had to keep our migration up to date and resolve merge conflicts carefully to avoid introducing unintended changes. Occasionally, upstream changes introduced new API usage without a direct Stable ABI equivalent. In these cases, we had to find alternatives or wrappers that preserved the original behavior.
-Each dependency also presented its own challenges, from differences in build and packaging processes to differences in how operators were registered and imported in Python. DeepGEMM was a particularly challenging dependency for many reasons. First, it was registering its operators using pybind11, which meant we had to update it to register its ops with TORCH_LIBRARY before we migrated to the stable ABI. Also, around the same time as our Stable ABI migration, DeepGEMM was transitioning from version 1.x to version 2.0, bringing a rapid stream of changes. This transition introduced a new dependency, DeepJIT, which depended on LibTorch and therefore needed to be migrated to the Stable ABI first. Around this same time, vLLM was bouncing back and forth between using DeepSeek's upstream repo and its own fork before finally settling on its own fork for the DeepGEMM library.
-
-Once the changes settled down, we migrated DeepJIT to the Stable ABI and moved vllm-project/DeepGEMM's operator registration from pybind11 to TORCH_LIBRARY. Since this was a large merge, we waited a few days before migrating to the Stable ABI. Just as we were about to merge, vLLM merged its branch with upstream, requiring us to make a substantial update to the Stable ABI. We were finally able to migrate DeepGEMM to the Stable ABI, and as of October 15, 2026, vLLM and its build dependencies are all torch ABI Stable.
-
-
-### Timeline
-- October 15, 2025 - RFC opened to begin discussion of migrating to the Stable ABI. https://github.com/vllm-project/vllm/issues/26946
-- Dec 29, 2025 - First migration PR opened: https://github.com/vllm-project/vllm/pull/31509
-- March 19, 2026 - First migration PR closed
-- March–June 19, 2026 - 12+ more PRs were merged, making vLLM in-tree torch ABI Stable.
-- July 14, 2026 - vLLM pins stable FlashMLA
-- July 20, 2026 - vLLM pins stable QuTLASS
-- July 31, 2026 - vLLM pins stable Flash Attention 2
-- Aug 3, 2026 - vLLM pins stable FlashKDA
-- Aug 6, 2026 - vLLM pins stable Flash Attention 3
-- September 13, 2026 - vLLM pins stable DeepSelect 
-- October 15, 2026 - vLLM pins stable DeepGEMM, making the vLLM CUDA wheel completely torch ABI Stable, exactly one year after #26946 was opened!
-
-
-### Example run on older torch
+### Example run on newer torch
 ```python
 import importlib
 import torch
