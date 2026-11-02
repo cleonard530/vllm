@@ -19,9 +19,11 @@ With the Stable ABI, users can upgrade to a compatible PyTorch version without r
 
 ### Tradoffs 
 Migrating vLLM to the Stable ABI comes with two main trade-offs: a more limited API surface and a small runtime overhead. Although the Stable ABI supports only a subset of LibTorch's APIs, it covers most of the APIs commonly used in vLLM, allowing us to migrate nearly all of its LibTorch API usage without workarounds. One exception is the method is_pinned(), which did not have a stable equivalent during the migration, so we had to replace
-`if (cpu_tensor.is_pinned())`
+```python
+if (cpu_tensor.is_pinned())`
+```
 with 
- ```
+```python
 std::array<StableIValue, 2> is_pinned_stack{
      torch::stable::detail::from(cpu_tensor),
      torch::stable::detail::from(std::nullopt)};
@@ -52,7 +54,15 @@ We also needed to verify that the new library no longer depended on unstable PyT
 Migrating vLLM source alone does not establish that the entire vLLM wheel is ABI-stable. For the wheel to be completely stable, its compiled dependencies must be torch ABI Stable as well. vLLM currently has 7 dependencies that also depend on LibTorch, these are:
 
 
-**Table**
+| **Dependency**   | **Migrated on vLLM Fork** | **Migrated Upstream**          |
+|------------------|---------------------------|--------------------------------|
+| FlashMLA         | ✅                        | ✅                             |
+| DeepGEMM         | ✅                        | 🚧 Work in progress            |
+| FlashAttention-2 | ✅                        | 🚧 PR open to make it stable   |
+| FlashAttention-3 | ✅                        | ✅                             |
+| DeepSelect       | ✅                        | 🚧 Work in progress            |
+| FlashKDA         | ✅                        | ❌                             |
+| QuTLASS          | N/A                       | ✅                             |
 
 After the in-tree vLLM code had been migrated, each of these dependencies was migrated to the torch Stable ABI as well, making the entire vLLM wheel LibTorch ABI Stable. We also added a CI check using [torch-abi-audit](https://pypi.org/project/torch-abi-audit/) to verify that every compiled library in the vLLM wheel remains torch ABI Stable.
 
@@ -78,7 +88,7 @@ October 15, 2026 - vLLM pins stable DeepGEMM, making the vLLM CUDA wheel complet
 
 
 ### Example run on older torch
-```
+```python
 import importlib
 import torch
 import vllm
