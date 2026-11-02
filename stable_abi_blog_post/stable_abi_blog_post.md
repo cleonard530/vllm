@@ -1,9 +1,18 @@
 ### Introduction
 
 vLLM relies heavily on PyTorch, with frequent calls to LibTorch in its C++ backend. As a result, changes to LibTorch’s binary interface may require vLLM to be rebuilt and relinked, even when the APIs remain unchanged. What if we could update LibTorch without rebuilding vLLM? That’s where the LibTorch Stable ABI comes in. With a LibTorch Stable ABI, updating LibTorch does not require rebuilding or updating vLLM in order to keep using it. Instead, we could swap out the LibTorch wheel and import it directly into our vLLM package. As of v0.33.0, vLLM publishes LibTorch ABI Stable CUDA wheels.  
+
 <div style="text-align: center;">
-<img src="images/unstable_import.png" alt="Unstable import" style="width: 49%; height: 250px; object-fit: contain;">
-<img src="images/stable_import.png" alt="Stable import" style="width: 49%; height: 250px; object-fit: contain;">
+<figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
+<img src="images/unstable_import.png" alt="Unstable import" style="width: 100%; height: 250px; object-fit: contain;">
+<figcaption>New torch requires vLLM to rebuild
+</figcaption>
+</figure>
+<figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
+<img src="images/stable_import.png" alt="Stable import" style="width: 100%; height: 250px; object-fit: contain;">
+<figcaption>vLLM can import new torch directly
+</figcaption>
+</figure>
 </div>
 
 ### What Is the LibTorch Stable ABI?
@@ -23,8 +32,16 @@ With the Stable ABI, users can upgrade to a compatible PyTorch version without r
 
 
 <div style="text-align: center;">
-<img src="images/unstable_vllm.png" alt="Unstable ABI diagram" style="width: 49%; height: 250px; object-fit: contain;">
-<img src="images/stable_vllm.png" alt="Stable ABI diagram" style="width: 49%; height: 250px; object-fit: contain;">
+<figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
+<img src="images/unstable_vllm.png" alt="Unstable ABI diagram" style="width: 100%; height: 250px; object-fit: contain;">
+<figcaption>vLLM needs to change as LibTorch changes
+</figcaption>
+</figure>
+<figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
+<img src="images/stable_vllm.png" alt="Stable ABI diagram" style="width: 100%; height: 250px; object-fit: contain;">
+<figcaption>vLLM can change independent of LibTorch
+</figcaption>
+</figure>
 </div>
 
 
