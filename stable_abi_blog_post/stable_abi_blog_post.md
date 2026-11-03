@@ -1,28 +1,28 @@
 # Migrating vLLM to the LibTorch Stable ABI
 
-vLLM Team, Red Hat PyTorch team, and Meta PyTorch Team
+vLLM Team, Red Hat PyTorch Team, and Meta PyTorch Team
 
 ### Introduction
 
-vLLM relies heavily on PyTorch, with frequent calls to LibTorch in its C++ backend. As a result, changes to LibTorch’s binary interface may require vLLM to be rebuilt and relinked, even when the APIs remain unchanged. What if we could update LibTorch without rebuilding vLLM? That’s where the LibTorch Stable ABI comes in. With a LibTorch Stable ABI, updating LibTorch does not require rebuilding or updating vLLM in order to keep using it. Instead, we could swap out the LibTorch wheel and import it directly into our vLLM package. As of v0.33.0, vLLM publishes LibTorch ABI Stable CUDA wheels.  
+vLLM relies heavily on PyTorch, with frequent calls to LibTorch in its C++ backend. As a result, changes to LibTorch’s binary interface may require vLLM to be rebuilt and relinked, even when the APIs remain unchanged. What if we could update LibTorch without rebuilding vLLM? That’s where the LibTorch Stable ABI comes in. With a LibTorch Stable ABI, updating LibTorch does not require rebuilding or updating vLLM in order to keep using it. Instead, we could swap out the torch wheel and import it directly into our vLLM package. As of v0.33.0, vLLM publishes LibTorch ABI Stable CUDA wheels.  
 
 <div style="text-align: center;">
 <figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
 <img src="images/unstable_import.png" alt="Unstable import" style="width: 100%; height: 250px; object-fit: contain;">
-<figcaption>New torch requires vLLM to rebuild
+<figcaption>Unstable ABI: New torch requires vLLM to rebuild
 </figcaption>
 </figure>
 <figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
 <img src="images/stable_import.png" alt="Stable import" style="width: 100%; height: 250px; object-fit: contain;">
-<figcaption>vLLM can import new torch directly
+<figcaption>Stable ABI: vLLM can import new torch directly
 </figcaption>
 </figure>
 </div>
 
 ### What Is the LibTorch Stable ABI?
-What is a Stable ABI? When a software library (such as LibTorch) is compiled into a binary, it exposes symbols that other programs can link against. The application binary interface (ABI) defines how these separately compiled components interact, including how functions are called, how data is represented in memory, and how symbols are named. Changes to these details can break binary compatibility, even when the source-level APIs remain unchanged. For example, changes to data layouts, function signatures, or C++ name mangling can prevent a program compiled against one version of a library from working with another. A stable ABI defines a set of binary interfaces and compatibility guarantees that allow programs to continue working across library updates without needing to be rebuilt, as long as they use interfaces covered by those guarantees. 
+An application binary interface (ABI) defines how compiled code interacts with a library: how functions are called, data is laid out, and symbols are named. Even if an API looks the same in source code, an ABI change can force extensions to rebuild. A stable ABI preserves a supported set of interfaces across compatible versions, so extensions that use them can keep working without a rebuild.
 
-PyTorch has implemented its own LibTorch Stable ABI, which consists of three components. The first is a stable C shim that exposes a limited subset of LibTorch's functionality through a C API. This allows extensions to be built against one version of PyTorch and run against compatible versions without needing to be rebuilt. The second component is a set of C++ convenience wrappers, provided in header files, that build on top of the C shim. These wrappers provide higher-level C++ APIs instead of requiring developers to work directly with the lower-level C API. The third component is a collection of header-only utilities in the torch::headeronly namespace. These utilities are implemented entirely in header files and do not depend on libtorch.so, allowing them to be used without linking against LibTorch.
+PyTorch's LibTorch Stable ABI has three layers: a stable C-shim exposing selected LibTorch APIs, C++ wrappers that make the shim easier to use, and headeronly utilities in `torch::headeronly` that do not link against `libtorch.so`.
 
 <img src="images/libtorch_stable.png" alt="LibTorch Stable" style="width: 100%; height: 250px; object-fit: contain;">
 
@@ -31,10 +31,7 @@ PyTorch has implemented its own LibTorch Stable ABI, which consists of three com
 
 
 ### Why Stable ABI Matters
-Before adopting the LibTorch Stable ABI, vLLM often needed to rebuild its binaries to support a new PyTorch version. It currently takes vLLM over a month after a new PyTorch release to update its support for that version. As a result, downstream users may have to wait to take advantage of new PyTorch features through vLLM.
-With the Stable ABI, users can upgrade to a compatible PyTorch version without rebuilding vLLM, provided the new version meets vLLM's compatibility requirements and the C++ and CUDA environments remain compatible. This allows users to adopt new PyTorch versions without waiting for a corresponding vLLM rebuild. For package distributors, the Stable ABI also decouples vLLM wheel releases from the PyTorch release cycle: a new PyTorch release no longer necessarily requires a new vLLM build, allowing the same vLLM binaries to work across multiple compatible PyTorch versions.
-
-
+Before the Stable ABI, a new PyTorch release could require a vLLM rebuild, delaying support for the new version and its features. With the Stable ABI, the same vLLM wheel can work across compatible PyTorch releases, letting users upgrade sooner and reducing rebuilds for package distributors.
 <div style="text-align: center;">
 <figure style="display: inline-block; width: 49%; margin: 0; vertical-align: top;">
 <img src="images/unstable_vllm.png" alt="Unstable ABI diagram" style="width: 100%; height: 250px; object-fit: contain;">
@@ -50,11 +47,16 @@ With the Stable ABI, users can upgrade to a compatible PyTorch version without r
 
 
 ### Tradeoffs
-Migrating vLLM to the Stable ABI comes with two main trade-offs: a more limited API surface and a small runtime overhead. Although the Stable ABI supports only a subset of LibTorch's APIs, it covers most of the APIs commonly used in vLLM, allowing us to migrate nearly all of its LibTorch API usage without workarounds. One exception is the method is_pinned(), which did not have a stable equivalent during the migration, so we had to replace
+The Stable ABI comes with a few tradeoffs.
+
+ First, a smaller API surface. The stable APIs cover most of the LibTorch APIs vLLM in-tree uses, but `is_pinned()` lacked a stable equivalent during the migration. Thus we needed to replace the direct call:
+
 ```cpp
 if (cpu_tensor.is_pinned())
 ```
-with 
+
+with a dispatcher call:
+
 ```cpp
 std::array<StableIValue, 2> is_pinned_stack{
      torch::stable::detail::from(cpu_tensor),
@@ -63,9 +65,10 @@ std::array<StableIValue, 2> is_pinned_stack{
      "aten::is_pinned", "", is_pinned_stack.data(), TORCH_ABI_VERSION));
  if (torch::stable::detail::to<bool>(is_pinned_stack[0]))
 ```
-This was the only major API limitation for in-tree vLLM, and an is_pinned() stable method was added in torch 2.14. 
- 
-The runtime overhead comes primarily from dispatch through the PyTorch dispatcher and the boxing and unboxing of StableIValue arguments and return values. Dispatch overhead is on the order of a few microseconds and the overhead from boxing and unboxing is even smaller. For most kernels, this overhead is negligible relative to execution time and becomes significant only in rare cases of frequently launching very short-running kernels without optimizations such as CUDA graphs. We observed no noticeable runtime regressions from the migration.
+
+PyTorch added a stable `is_pinned()` method in version 2.14.
+
+The second tradeoff is a small runtime overhead. Dispatching calls through `TORCH_LIBRARY` adds a few microseconds and adding the boxing and unboxing of  `StableIValue` values adds a few more nanoseconds to this. This overhead is usually negligible relative to execution time, and becomes significant only in rare cases of frequently launching very short-running kernels without optimizations such as CUDA graphs. We saw no noticeable runtime regression during the migration.
 
 
 <style>
@@ -93,7 +96,7 @@ The runtime overhead comes primarily from dispatch through the PyTorch dispatche
 <h3>Migrating vLLM to the Stable ABI</h3>
 <p>We have broken down the migration to the Stable ABI into a series of steps:</p>
 <p>1. <strong>Assess the situation</strong></p> 
-<p>First, we assessed whether vLLM could migrate using the stable APIs available at the time. We inventoried its PyTorch API calls, identified gaps, and planned the stable APIs needed to fill them. This work is outlined in the original <a href="https://github.com/vllm-project/vllm/issues/26946">RFC LibTorch ABI Stable vLLM</a>.</p>
+<p>First, we assessed whether vLLM could migrate using the stable APIs available at the time. We inventoried its PyTorch API calls, identified gaps, and planned the stable APIs needed to fill them. This work is outlined in the original <a href="https://github.com/vllm-project/vllm/issues/26946">RFC</a> for updating vLLM's CUDA build to use the LibTorch Stable ABI.</p>
 </div>
 <div class="abi-story__event">
 <h4>Timeline</h4>
@@ -114,7 +117,7 @@ The runtime overhead comes primarily from dispatch through the PyTorch dispatche
 <div class="abi-story__row">
 <div class="abi-story__copy">
 <p>3. <strong>Set up necessary scaffolding</strong></p> 
-<p>Since vLLM is such a big project, with over 175 .cpp/.cu source files plus another 120+ header files in its CUDA build alone, we can't hope to migrate it all in one go. So instead we created a separate stable library (see CMakeLists.txt updates in the first migration <a href="https://github.com/vllm-project/vllm/pull/31509">PR #31509</a>), and we migrated the kernels to this library in manageable chunks.</p>
+<p>Since vLLM is such a big project, with over 175 .cpp/.cu source files plus another 120+ header files in its CUDA build alone, we can't hope to migrate it all in one go. So instead we created a separate stable library (see CMakeLists.txt updates in the first migration <a href="https://github.com/vllm-project/vllm/pull/31509/changes#diff-1e7de1ae2d059d21e1dd75d5812d5a34b0222cef273b7c3a2af62eb747f9d20a">PR #31509</a>), and we migrated the kernels to this library in manageable chunks.</p>
 <figure style="margin: 0; text-align: center;">
 <img src="images/unstable_to_stable_library.png" alt="vLLM migration from the unstable library to the stable library" style="width: 100%; height: auto;">
 <figcaption>As the stable library grows, the unstable library shrinks until it disappears</figcaption>
@@ -143,7 +146,7 @@ The runtime overhead comes primarily from dispatch through the PyTorch dispatche
 <div class="abi-story__row">
 <div class="abi-story__copy">
 <p>5. <strong>Migrate each source file to use stable APIs</strong></p> 
-<p>Once steps 1–4 are in place, we can migrate each source file to stable APIs. Any PyTorch headers we include should come from the C++ stable wrappers, the headeronly utilities, or the C-shim iself:</p>
+<p>Once steps 1–4 are in place, we can migrate each source file to stable APIs. Any PyTorch headers we include should come from the C++ stable wrappers, the headeronly utilities, or the C-shim itself:</p>
 <ul>
 <li><code>torch/csrc/stable</code></li>
 <li><code>torch/headeronly</code></li>
@@ -167,7 +170,7 @@ The runtime overhead comes primarily from dispatch through the PyTorch dispatche
 <div class="abi-story__row">
 <div class="abi-story__copy">
 <p>6. <strong>Verify!</strong></p> 
-<p>vLLM is used by millions of users across multiple industries, and we do not want to interrupt any of their processes with our migration. Therefore, the most important step in this list is to <strong>verify</strong> that the migration did not make any noticeable changes. This means running appropriate unit and performance tests and manually reviewing each migration diff line by line to make sure there were no unintended changes.</p>
+<p>vLLM is used by millions of users across multiple industries, and we do not want to interrupt any of their processes with the migration. Therefore, the most important step in this list is to <strong>verify</strong> that the migration did not make any significant changes. This means running appropriate unit and performance tests and manually reviewing each migration diff line by line to make sure there were no unintended updates.</p>
 
 <p>Along with verifying correctness, we also need to verify that the new library is LibTorch ABI Stable. For this, we use <a href="https://pypi.org/project/torch-abi-audit/">torch-abi-audit</a> (thanks Ralf Gommers!). This tool inspects .so files and categorizes stable and unstable PyTorch symbols. If there are no unstable symbols, the library is LibTorch ABI Stable. It also reports the minimum LibTorch version that provides all the required stable symbols (for example, <code>min-torch=2.11.0</code>). We used it to track migration progress and check for regressions, and now use it in vLLM CI to ensure the wheel remains LibTorch ABI Stable.</p>
 <pre style="overflow-x: auto;"><code class="language-console">torch-abi-audit vllm 
@@ -217,7 +220,7 @@ Package: vllm
 </tbody>
 </table>
 </div>
-<p>After the in-tree vLLM code had been migrated, each of these dependencies was migrated to the LibTorch Stable ABI as well, making the entire vLLM wheel LibTorch ABI Stable.</p>
+<p>After the in-tree vLLM code had been migrated, each of these dependencies was migrated to the LibTorch Stable ABI as well, making the entire vLLM CUDA wheel LibTorch ABI Stable.</p>
 
 <pre style="overflow-x: auto;"><code class="language-console">torch-abi-audit vllm
 Package: vllm
@@ -254,18 +257,13 @@ Package: vllm
 <div class="abi-story__copy">
 <h3>Challenges Along the Way</h3>
 <p>The biggest challenge was keeping pace with a large, rapidly changing project. Upstream files often changed while our migration patches were in progress, so we had to update those patches before they could merge. vLLM’s external dependencies also meant coordinating across projects and building support for the migration. At the API level, we sometimes needed wrappers for functions without Stable ABI equivalents or for operator arguments with unsupported types, such as using <code>int</code> instead of <code>int64_t</code>.</p>
-
 </div>
 <div class="abi-story__event">
 </div>
 </div>
 
-
-
 <div class="abi-story__row">
 <div class="abi-story__copy">
-
-
 <p>DeepGEMM illustrates all of these challenges in one migration, along with several additional complications. Migrating it required us to:</p>
 
 <ul>
@@ -276,21 +274,19 @@ Package: vllm
 </li>
 <li>Account for ongoing repository changes, including vLLM’s switch from upstream DeepGEMM to its own fork</li>
 </ul>
-
 </div>
 <div class="abi-story__event">
 <p><strong>July 27–29, 2026</strong><br>First PRs to migrate DeepGEMM off pybind11 and onto the Stable ABI opened.</p>
 </div>
 </div>
 
-
 <div class="abi-story__row">
 <div class="abi-story__copy">
-<p>Once we had addressed these issues, we migrated DeepGEMM, the last remaining vLLM dependency. With that final piece in place, the entire vLLM wheel was LibTorch ABI Stable!</p>
+<p>Resolving these issues took more than a few API changes. We moved DeepGEMM's registration to <code>TORCH_LIBRARY</code>, added wrappers where the Stable ABI lacked direct support, and kept the migration current as DeepGEMM evolved. Once those changes were in place, we migrated DeepGEMM, the last remaining dependency. With the in-tree code and every LibTorch-dependent component now migrated, the entire vLLM CUDA wheel became LibTorch ABI Stable exactly one year after the original RFC!</p>
 
 </div>
 <div class="abi-story__event">
-<p><strong>October 15, 2026</strong><br>DeepGEMM migrated to the Stable ABI, making the vLLM CUDA wheel completely LibTorch ABI Stable—exactly one year after the <a href="https://github.com/vllm-project/vllm/issues/26946">RFC</a> was opened.</p>
+<p><strong>October 15, 2026</strong><br>DeepGEMM migrated; the vLLM CUDA wheel became LibTorch ABI Stable.</p>
 </div>
 </div>
 </div>
@@ -299,6 +295,7 @@ Package: vllm
 ### Example Run on Newer PyTorch
 
 ```python
+# stable_abi_demo.py
 import importlib
 import torch
 import vllm
@@ -314,33 +311,31 @@ out = torch.empty(2, 4, device="cuda", dtype=x.dtype)
 torch.ops._C.silu_and_mul(out, x)
 print(f"silu_and_mul output:\n{out}")
 ```
-**Output**
 
-Run the demo with PyTorch 2.14.1:
+Build vLLM and run the demo with PyTorch 2.14.1:
 
-```
-python stable_abi_demo.py           
+<pre><code><span style="color: #6d95ed;">python stable_abi_demo.py</span>
 PyTorch runtime: 2.14.1+cu132
 vLLM: 0.1.dev24235+gc9af9acc6.d20261030
 silu_and_mul output:
 tensor([[1.0731e-02, 1.9132e-02, 2.9671e-02, 3.3464e-02],
         [0.0000e+00, 3.6553e+00, 1.0570e+01, 2.0004e+01]], device='cuda:0')
-```
+</code></pre>
 
-Update the PyTorch wheel to torch==2.15.0:
-```
-uv pip install torch==2.15.0 \
-  --index-url https://download.pytorch.org/whl/cu132
-```
-Rerun the script:
-```
-python stable_abi_demo.py
+Update the PyTorch wheel to `torch==2.15.0`:
+
+<pre><code><span style="color: #6d95ed;">uv pip install torch==2.15.0 \
+  --index-url https://download.pytorch.org/whl/cu132</span>
+</code></pre>
+Rerun demo without rebuilding vLLM:
+
+<pre><code><span style="color: #6d95ed;">python stable_abi_demo.py</span>
 PyTorch runtime: 2.15.0+cu132
 vLLM: 0.1.dev24235+gc9af9acc6.d20261030
 silu_and_mul output:
 tensor([[1.0731e-02, 1.9132e-02, 2.9671e-02, 3.3464e-02],
         [0.0000e+00, 3.6553e+00, 1.0570e+01, 2.0004e+01]], device='cuda:0')
-```
+</code></pre>
 
 ### Future Work
 
@@ -353,6 +348,6 @@ We are also expanding the stable API surface so that vLLM and its dependencies n
 
 ### Acknowledgement to main contributors
 
-- vLLM Community: Shengqi Chen (main coordinator), Jiangyun Zhu (DeepSelect fork migration), Thien Tran (FlashKDA fork migration), Roberto L. Castro (upstream QuTLASS migration), Kaichao You (roadmap), and all maintainers who have reviewed our PRs and gave suggestions
-- PyTorch Community: Jane Xu (project lead, FlashMLA migration in both fork & upstream, abi-stable-skills project), Chris Leonard (major migration work), Mikayla Gawarecki (early-stage migration work for in-tree source), Ralf Gommers (torch-abi-audit project)
-- DeepSeek: Chenggang Zhao, Yichen Yan, Shengyu Liu
+- vLLM Community: <a href="https://github.com/Harry-Chen">Shengqi Chen</a> (main coordinator), <a href="https://github.com/ZJY0516">Jiangyun Zhu</a> (DeepSelect fork migration), <a href="https://github.com/gau-nernst">Thien Tran</a> (FlashKDA fork migration), <a href="https://github.com/LopezCastroRoberto">Roberto L. Castro</a>  (upstream QuTLASS migration), <a href="https://github.com/youkaichao">Kaichao You</a> (roadmap), and all maintainers who have reviewed our PRs and gave suggestions
+- PyTorch Community: <a href="https://github.com/janeyx99">Jane Xu</a> (project lead, FlashMLA migration in both fork & upstream, <a href="https://github.com/janeyx99/abi-stable-skills">abi-stable-skills</a> project), <a href="https://github.com/cleonard530">Chris Leonard</a>  (major migration work), <a href="https://github.com/mikaylagawarecki">Mikayla Gawarecki</a>  (early-stage migration work for in-tree source), <a href="https://github.com/rgommers">Ralf Gommers</a> (<a href="https://pypi.org/project/torch-abi-audit/">torch-abi-audit</a> project)
+- DeepSeek: <a href="https://github.com/LyricZhao">Chenggang Zhao</a>, <a href="https://github.com/oraluben">Yichen Yan</a>, <a href="https://github.com/interestingLSY">Shengyu Liu</a> 
